@@ -1,0 +1,169 @@
+import ccxt
+import pandas as pd
+import csv
+
+def fetch_ohlcv(exchange_id, symbol, timeframe, limit=300):
+ """Fetch OHLCV candlestick data from a public exchange API."""
+ exchange = getattr(ccxt, exchange_id)()
+ ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+ df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+ df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+ return df
+
+def moving_average_crossover(df, fast=10, slow=30):
+ """Generate buy/sell signals based on fast/slow moving average crossover."""
+ df = df.copy()
+ df["fast_ma"] = df["close"].rolling(window=fast).mean()
+ df["slow_ma"] = df["close"].rolling(window=slow).mean()
+ df["signal"] = 0
+ df.loc[df["fast_ma"] > df["slow_ma"], "signal"] = 1
+ df.loc[df["fast_ma"] < df["slow_ma"], "signal"] = -1
+ df["position"] = df["signal"].shift(1).fillna(0)
+ return df
+
+def backtest(df, initial_balance=1000.0, fee_rate=0.001, stop_loss_pct=5.0):
+ """Simulate trades on historical data with a stop-loss rule. No real orders."""
+ balance = initial_balance
+ position = 0.0
+ entry_price = 0.0
+ trades = []
+ equity_curve = []
+
+ for i in range(1, len(df)):
+ row = df.iloc[i]
+ prev_row = df.iloc[i - 1]
+
+ prev_position = prev_row["position"]
+ current_position = row["position"]
+ current_price = row["close"]
+
+ # Stop-loss check: if long and price dropped more than stop_loss_pct from entry
+ if position > 0 and entry_price > 0:
+ drop_pct = (entry_price - current_price) / entry_price * 100
+ if drop_pct >= stop_loss_pct:
+ proceeds = position * current_price * (1 - fee_rate)
+ balance = proceeds
+ trades.append({
+ "type": "STOP-LOSS SELL",
+ "timestamp": row["timestamp"],
+ "price": current_price,
+ "amount": position,
+ "balance_after": balance,
+ })
+ position = 0.0
+ entry_price = 0.0
+ equity_curve.append({
+ "timestamp": row["timestamp"],
+ "equity": balance,
+ })
+ continue
+
+ # Entry: flat -> long
+ if prev_position == 0 and current_position == 1:
+ price = current_price
+ cost = balance * (1 - fee_rate)
+ position = cost / price
+ entry_price = price
+ balance = 0.0
+ trades.append({
+ "type": "BUY",
+ "timestamp": row["timestamp"],
+ "price": price,
+ "amount": position,
+ "balance_after": balance,
+ })
+
+ # Exit: long -> flat (MA cross down)
+ elif prev_position == 1 and current_position == 0:
+ price = current_price
+ proceeds = position * price * (1 - fee_rate)
+ balance = proceeds
+ trades.append({
+ "type": "SELL",
+ "timestamp": row["timestamp"],
+ "price": price,
+ "amount": position,
+ "balance_after": balance,
+ })
+ position = 0.0
+ entry_price = 0.0
+
+ # Mark-to-market equity
+ if position > 0:
+ equity = position * current_price
+ else:
+ equity = balance
+ equity_curve.append({
+ "timestamp": row["timestamp"],
+ "equity": equity,
+ })
+
+ # Close any open position at the last price
+ if position > 0:
+ last_price = df.iloc[-1]["close"]
+ balance = position * last_price * (1 - fee_rate)
+ position = 0.0
+ entry_price = 0.0
+ trades.append({
+ "type": "SELL (forced close)",
+ "timestamp": df.iloc[-1]["timestamp"],
+ "price": last_price,
+ "amount": 0.0,
+ "balance_after": balance,
+ })
+
+ total_return = (balance - initial_balance) / initial_balance * 100
+ return {
+ "initial_balance": initial_balance,
+ "final_balance": round(balance, 2),
+ "total_return_pct": round(total_return, 2),
+ "total_trades": len(trades),
+ "trades": trades,
+ "equity_curve": equity_curve,
+ }
+
+def print_report(result):
+ print("=" * 50)
+ print("PAPER TRADING BACKTEST REPORT")
+ print("=" * 50)
+ print(f"Initial balance : {result['initial_balance']:.2f} USDT")
+ print(f"Final balance : {result['final_balance']:.2f} USDT")
+ print(f"Total return : {result['total_return_pct']:.2f}%")
+ print(f"Total trades : {result['total_trades']}")
+ print("-" * 50)
+ print("Last 5 trades:")
+ for t in result["trades"][-5:]:
+ print(f" {t['timestamp']} | {t['type']} | {t['price']:.2f} | {t['amount']:.6f}")
+ print("=" * 50)
+
+def export_trades_csv(trades, filename="trades.csv"):
+ """Export trade history to a CSV file."""
+ if not trades:
+ print("No trades to export.")
+ return
+ with open(filename, "w", newline="") as f:
+ writer = csv.DictWriter(f, fieldnames=["timestamp", "type", "price", "amount", "balance_after"])
+ writer.writeheader()
+ for t in trades:
+ writer.writerow(t)
+ print(f"Trades exported to {filename}")
+
+def export_equity_csv(equity_curve, filename="equity.csv"):
+ """Export equity curve to a CSV file."""
+ if not equity_curve:
+ print("No equity data to export.")
+ return
+ with open(filename, "w", newline="") as f:
+ writer = csv.DictWriter(f, fieldnames=["timestamp", "equity"])
+ writer.writeheader()
+ for row in equity_curve:
+ writer.writerow(row)
+ print(f"Equity curve exported to {filename}")
+
+if __name__ == "__main__":
+ df = fetch_ohlcv("binance", "BTC/USDT", "1h", limit=300)
+ df = moving_average_crossover(df, fast=10, slow=30)
+ result = backtest(df, initial_balance=1000.0, fee_rate=0.001, stop_loss_pct=5.0)
+ print_report(result)
+ export_trades_csv(result["trades"], "trades.csv")
+ export_equity_csv(result["equity_curve"], "equity.csv")
